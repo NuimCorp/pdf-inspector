@@ -10,11 +10,11 @@ use pdf_inspector::{
 };
 use pdf_inspector::{
     detect_pdf_type, detect_vector_grid_in_region_mem, extract_pages_markdown,
-    extract_pages_markdown_mem, extract_tables_in_regions_mem, extract_text,
-    extract_text_in_regions_mem, extract_text_with_positions, extract_text_with_positions_mem,
-    process_pdf_mem, process_pdf_mem_with_options, process_pdf_with_options, to_markdown,
-    to_markdown_from_items_with_rects_and_page_count, MarkdownOptions, PdfError, PdfOptions,
-    PdfType, TextItem,
+    extract_pages_markdown_mem, extract_structured_pages_mem, extract_tables_in_regions_mem,
+    extract_text, extract_text_in_regions_mem, extract_text_with_positions,
+    extract_text_with_positions_mem, process_pdf_mem, process_pdf_mem_with_options,
+    process_pdf_with_options, to_markdown, to_markdown_from_items_with_rects_and_page_count,
+    MarkdownOptions, PdfError, PdfOptions, PdfType, TextItem,
 };
 use pdf_inspector::{
     detect_pdf_type_mem, detect_pdf_type_mem_with_config, PageOcrReasons,
@@ -405,6 +405,53 @@ fn make_text_item_with_font(
 // ============================================================================
 // Detection Config Tests
 // ============================================================================
+
+#[test]
+fn structured_pages_return_rendered_geometry_and_native_content() {
+    let buffer = make_text_pdf_with_rotate(
+        "BT /F1 12 Tf 30 60 Td (Structured page) Tj ET",
+        "0 0 612 792",
+        Some("10 20 210 420"),
+        Some(90),
+        None,
+        HELVETICA_FONT,
+    );
+
+    let result = extract_structured_pages_mem(&buffer).unwrap();
+
+    assert!(result.pages_recommended_for_ocr.is_empty());
+    assert_eq!(result.pages.len(), 1);
+    let page = &result.pages[0];
+    assert_eq!(page.page, 0);
+    assert_eq!((page.width, page.height), (400.0, 200.0));
+    assert!(page.markdown.contains("Structured page"));
+    assert!(page.items.iter().any(|item| item.text == "Structured page"));
+    assert!(page.items.iter().all(|item| {
+        item.x >= 0.0
+            && item.y >= 0.0
+            && item.x + item.width <= page.width
+            && item.y + item.height <= page.height
+    }));
+}
+
+#[test]
+fn structured_pages_return_tables_and_exact_ocr_routing() {
+    let native = extract_structured_pages_mem(&synthetic_vector_grid_pdf(false)).unwrap();
+    assert_eq!(native.pages.len(), 1);
+    assert_eq!(native.pages[0].tables.len(), 1);
+    assert_eq!(native.pages[0].tables[0].cells.len(), 2);
+
+    let scanned = make_pdf_with_glyph_layer(&[GlyphLayerPage {
+        layer_mode: None,
+        ..SCAN_WITH_INVISIBLE_LAYER
+    }]);
+    let routed = extract_structured_pages_mem(&scanned).unwrap();
+    assert_eq!(routed.pages_recommended_for_ocr, vec![0]);
+    assert_eq!(
+        routed.pages[0].ocr_reasons,
+        vec![OCR_REASON_SCANNED.to_string()]
+    );
+}
 
 #[test]
 fn test_detection_config_default() {

@@ -79,7 +79,7 @@ impl PageBox {
     /// counter-clockwise turn, `(+y0, -x0)` for a clockwise one — so the
     /// items, rects and lines it produced stay consistent with region bounds
     /// computed from the visible box height.
-    fn shift(&self, rotation: PageRotation) -> (f32, f32) {
+    pub(crate) fn shift(&self, rotation: PageRotation) -> (f32, f32) {
         rotation.rotate_point(-self.x0, -self.y0)
     }
 
