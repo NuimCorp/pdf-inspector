@@ -7,6 +7,15 @@ version. A separate release pull request bumps the manifests with
 version and date. Earlier releases are described in their
 [GitHub releases](https://github.com/firecrawl/pdf-inspector/releases).
 
+## Unreleased
+
+### Added
+
+- `extract_structured_pages_mem`: a one-parse Rust API for ordered page
+  content, rendered dimensions, positioned items and links, recovered tables,
+  per-page Markdown, and exact zero-based OCR recommendations with
+  machine-readable reasons.
+
 ## [1.24.0] - 2026-09-22
 
 Changes since 1.23.0.

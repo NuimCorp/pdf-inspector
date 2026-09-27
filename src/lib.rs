@@ -549,8 +549,49 @@ pub struct PagesExtractionResult {
     pub is_complex: bool,
 }
 
+/// A data table recovered from a page, in the rendered page coordinate frame.
+#[derive(Debug, Clone)]
+pub struct StructuredPageTable {
+    /// Axis-aligned table bounds `[x, y, width, height]` in PDF points.
+    pub bounds: [f32; 4],
+    /// Cell contents indexed by row, then column.
+    pub cells: Vec<Vec<String>>,
+}
+
+/// Structured content for one PDF page.
+#[derive(Debug, Clone)]
+pub struct StructuredPage {
+    /// Zero-based page index.
+    pub page: u32,
+    /// Rendered page width in PDF points.
+    pub width: f32,
+    /// Rendered page height in PDF points.
+    pub height: f32,
+    /// Positioned content in reading order. Links are represented by
+    /// [`ItemType::Link`].
+    pub items: Vec<TextItem>,
+    /// Data tables recovered from native PDF structure and geometry.
+    pub tables: Vec<StructuredPageTable>,
+    /// Markdown generated from this page's native content.
+    pub markdown: String,
+    /// Whether this page should be sent to OCR.
+    pub needs_ocr: bool,
+    /// Machine-readable OCR reason identifiers.
+    pub ocr_reasons: Vec<String>,
+}
+
+/// One-parse structured extraction result for a PDF.
+#[derive(Debug)]
+pub struct StructuredPagesExtractionResult {
+    /// Pages in document order.
+    pub pages: Vec<StructuredPage>,
+    /// Zero-based indexes of pages that should be sent to OCR.
+    pub pages_recommended_for_ocr: Vec<u32>,
+}
+
 pub(crate) struct InternalPagesExtraction {
     pub(crate) result: PagesExtractionResult,
+    structured_pages: Option<Vec<StructuredPage>>,
     #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
     pub(crate) page_count: u32,
     #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
@@ -589,11 +630,42 @@ pub fn extract_pages_markdown_mem(
         pages,
         None,
         &MarkdownOptions::default(),
-        false,
-        false,
-        false,
+        PageExtractionMode::default(),
     )
     .map(|extraction| extraction.result)
+}
+
+/// Extract positioned content, tables, Markdown, dimensions, and exact OCR
+/// routing from a memory buffer.
+///
+/// The PDF is parsed once and its content streams are extracted once. Page
+/// geometry is returned in the rendered page frame: the visible page box
+/// after applying the page's inherited `/Rotate`.
+pub fn extract_structured_pages_mem(
+    buffer: &[u8],
+) -> Result<StructuredPagesExtractionResult, PdfError> {
+    let extraction = extract_pages_markdown_mem_impl(
+        buffer,
+        None,
+        None,
+        &MarkdownOptions::default(),
+        PageExtractionMode {
+            include_structure: true,
+            ..PageExtractionMode::default()
+        },
+    )?;
+    let pages = extraction
+        .structured_pages
+        .expect("structured extraction requested");
+    let pages_recommended_for_ocr = pages
+        .iter()
+        .filter(|page| page.needs_ocr)
+        .map(|page| page.page)
+        .collect();
+    Ok(StructuredPagesExtractionResult {
+        pages,
+        pages_recommended_for_ocr,
+    })
 }
 
 #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
@@ -612,10 +684,21 @@ pub(crate) fn extract_pages_markdown_mem_for_ocr(
         pages,
         password,
         markdown_options,
-        markdown_options.strip_headers_footers,
-        true,
-        render_repairs,
+        PageExtractionMode {
+            strip_repeated_headers_footers: markdown_options.strip_headers_footers,
+            preserve_ocr_candidates: true,
+            render_repairs,
+            include_structure: false,
+        },
     )
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PageExtractionMode {
+    strip_repeated_headers_footers: bool,
+    preserve_ocr_candidates: bool,
+    render_repairs: bool,
+    include_structure: bool,
 }
 
 fn extract_pages_markdown_mem_impl(
@@ -623,10 +706,14 @@ fn extract_pages_markdown_mem_impl(
     pages: Option<&[u32]>,
     password: Option<&str>,
     markdown_options: &MarkdownOptions,
-    strip_repeated_headers_footers: bool,
-    preserve_ocr_candidates: bool,
-    render_repairs: bool,
+    mode: PageExtractionMode,
 ) -> Result<InternalPagesExtraction, PdfError> {
+    let PageExtractionMode {
+        strip_repeated_headers_footers,
+        preserve_ocr_candidates,
+        render_repairs,
+        include_structure,
+    } = mode;
     validate_pdf_bytes(buffer)?;
     let (doc, page_count, repairs) = load_document_from_mem_with_repairs(buffer, password)?;
     #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
@@ -644,7 +731,7 @@ fn extract_pages_markdown_mem_impl(
             .filter_map(|page| page.checked_add(1))
             .collect()
     });
-    let ((all_items, all_rects, all_lines), page_thresholds, gid_pages, _page_rotations, _) =
+    let ((all_items, all_rects, all_lines), page_thresholds, gid_pages, page_rotations, _) =
         if let Some(required_pages) = required_pages.as_ref() {
             extractor::extract_positioned_text_for_document_analysis(
                 &doc,
@@ -692,6 +779,7 @@ fn extract_pages_markdown_mem_impl(
     };
 
     let mut results = Vec::with_capacity(pages_slice.len());
+    let mut structured_pages = include_structure.then(|| Vec::with_capacity(pages_slice.len()));
     let mut pages_needing_ocr = Vec::new();
     let mut ocr_reasons_by_page = BTreeMap::new();
     #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
@@ -735,6 +823,55 @@ fn extract_pages_markdown_mem_impl(
             .filter(|l| l.page == page_1idx)
             .cloned()
             .collect();
+
+        let structured_geometry = if include_structure {
+            let page_id = lopdf_pages.get(&page_1idx).copied();
+            let page_box = page_id
+                .and_then(|id| extractor::visible_page_box(&doc, id))
+                .unwrap_or(extractor::PageBox::LETTER);
+            let turn = page_rotations
+                .get(&page_1idx)
+                .copied()
+                .unwrap_or(extractor::geometry::PageRotation::Upright);
+            let display = page_id.map(|id| extractor::DisplayPage::new(&doc, id, page_box));
+            let mut items = page_items.clone();
+            page_box.translate_items(&mut items, turn);
+            if let Some(display) = display {
+                extractor::display_frame::items_to_display_frame(
+                    &mut items,
+                    turn,
+                    display.rotate,
+                    &display.sheet,
+                );
+            }
+            let (width, height) = display
+                .map(|display| display.rotate.display_size(&display.sheet))
+                .unwrap_or((page_box.width(), page_box.height()));
+            let tables = recover_structured_page_tables(&page_items, &page_rects, &page_lines)
+                .into_iter()
+                .map(|mut table| {
+                    let [mut x, mut y, mut width, mut height] = table.bounds;
+                    let (dx, dy) = page_box.shift(turn);
+                    x += dx;
+                    y += dy;
+                    turn.unrotate_box(&mut x, &mut y, &mut width, &mut height);
+                    if let Some(display) = display {
+                        (x, y, width, height) = display.rotate.sheet_box_to_display(
+                            &display.sheet,
+                            x,
+                            y,
+                            width,
+                            height,
+                        );
+                    }
+                    table.bounds = [x, y, width, height];
+                    table
+                })
+                .collect();
+            Some((items, tables, width, height))
+        } else {
+            None
+        };
 
         #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
         {
@@ -844,6 +981,32 @@ fn extract_pages_markdown_mem_impl(
             pages_needing_ocr.push(page_1idx);
         }
 
+        if let (Some(pages), Some((items, tables, width, height))) =
+            (structured_pages.as_mut(), structured_geometry)
+        {
+            let mut structured_ocr_reasons = ocr_reasons_by_page
+                .get(&page_1idx)
+                .cloned()
+                .unwrap_or_default();
+            if needs_ocr && structured_ocr_reasons.is_empty() {
+                structured_ocr_reasons.push(OCR_REASON_NO_TEXT.to_string());
+            }
+            pages.push(StructuredPage {
+                page: page_0idx,
+                width,
+                height,
+                items,
+                tables,
+                markdown: if needs_ocr && !preserve_ocr_candidates {
+                    String::new()
+                } else {
+                    md.clone()
+                },
+                needs_ocr,
+                ocr_reasons: structured_ocr_reasons,
+            });
+        }
+
         results.push(PageMarkdown {
             page: page_0idx,
             // The public native extractor continues to suppress unreliable
@@ -869,6 +1032,7 @@ fn extract_pages_markdown_mem_impl(
             ocr_reasons_by_page: page_ocr_reasons_vec(ocr_reasons_by_page),
             is_complex: complexity.is_complex,
         },
+        structured_pages,
         #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
         page_count,
         #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
@@ -6846,6 +7010,88 @@ fn compute_layout_complexity_with_chart_regions(
         pages_with_tables,
         pages_with_columns,
     }
+}
+
+fn recover_structured_page_tables(
+    items: &[types::TextItem],
+    rects: &[types::PdfRect],
+    lines: &[types::PdfLine],
+) -> Vec<StructuredPageTable> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+
+    let page = items[0].page;
+    let base_size = markdown::analysis::calculate_font_stats_from_items(items).most_common_size;
+    let page_content_width = tables::content_width(items);
+    let bands = markdown::split_side_by_side(items);
+    let band_ranges = if bands.is_empty() {
+        vec![(f32::MIN, f32::MAX)]
+    } else {
+        bands
+    };
+    let mut recovered = Vec::new();
+
+    for (x_lo, x_hi) in band_ranges {
+        let margin = 2.0;
+        let band_items: Vec<types::TextItem> = items
+            .iter()
+            .filter(|item| x_lo == f32::MIN || (item.x >= x_lo - margin && item.x < x_hi + margin))
+            .cloned()
+            .collect();
+        let band_rects: Vec<types::PdfRect> = if x_lo == f32::MIN {
+            rects.to_vec()
+        } else {
+            markdown::filter_rects_to_band(rects, page, x_lo, x_hi)
+        };
+        let band_lines: Vec<types::PdfLine> = if x_lo == f32::MIN {
+            lines.to_vec()
+        } else {
+            markdown::filter_lines_to_band(lines, page, x_lo, x_hi)
+        };
+
+        let (rect_tables, _) = tables::detect_tables_from_rects(&band_items, &band_rects, page);
+        let line_tables = tables::detect_tables_from_lines(&band_items, &band_lines, page);
+        let heuristic_tables = tables::detect_tables_with_page_width(
+            &band_items,
+            base_size,
+            false,
+            page_content_width,
+        );
+        let selected = [&rect_tables, &line_tables, &heuristic_tables]
+            .into_iter()
+            .find(|candidates| {
+                candidates
+                    .iter()
+                    .any(|table| table.kind == tables::TableKind::Data)
+            });
+
+        if let Some(tables) = selected {
+            recovered.extend(
+                tables
+                    .iter()
+                    .filter(|table| table.kind == tables::TableKind::Data)
+                    .filter_map(structured_page_table),
+            );
+        }
+    }
+
+    recovered
+}
+
+fn structured_page_table(table: &tables::Table) -> Option<StructuredPageTable> {
+    let x0 = table.columns.iter().copied().reduce(f32::min)?;
+    let x1 = table.columns.iter().copied().reduce(f32::max)?;
+    let y0 = table.rows.iter().copied().reduce(f32::min)?;
+    let y1 = table.rows.iter().copied().reduce(f32::max)?;
+    let bounds = [x0, y0, x1 - x0, y1 - y0];
+    if !bounds.iter().all(|value| value.is_finite()) || bounds[2] <= 0.0 || bounds[3] <= 0.0 {
+        return None;
+    }
+    Some(StructuredPageTable {
+        bounds,
+        cells: table.cells.clone(),
+    })
 }
 
 #[derive(Debug, thiserror::Error)]
