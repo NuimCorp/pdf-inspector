@@ -630,10 +630,7 @@ pub fn extract_pages_markdown_mem(
         pages,
         None,
         &MarkdownOptions::default(),
-        false,
-        false,
-        false,
-        false,
+        PageExtractionMode::default(),
     )
     .map(|extraction| extraction.result)
 }
@@ -652,10 +649,10 @@ pub fn extract_structured_pages_mem(
         None,
         None,
         &MarkdownOptions::default(),
-        false,
-        false,
-        false,
-        true,
+        PageExtractionMode {
+            include_structure: true,
+            ..PageExtractionMode::default()
+        },
     )?;
     let pages = extraction
         .structured_pages
@@ -687,11 +684,21 @@ pub(crate) fn extract_pages_markdown_mem_for_ocr(
         pages,
         password,
         markdown_options,
-        markdown_options.strip_headers_footers,
-        true,
-        render_repairs,
-        false,
+        PageExtractionMode {
+            strip_repeated_headers_footers: markdown_options.strip_headers_footers,
+            preserve_ocr_candidates: true,
+            render_repairs,
+            include_structure: false,
+        },
     )
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PageExtractionMode {
+    strip_repeated_headers_footers: bool,
+    preserve_ocr_candidates: bool,
+    render_repairs: bool,
+    include_structure: bool,
 }
 
 fn extract_pages_markdown_mem_impl(
@@ -699,11 +706,14 @@ fn extract_pages_markdown_mem_impl(
     pages: Option<&[u32]>,
     password: Option<&str>,
     markdown_options: &MarkdownOptions,
-    strip_repeated_headers_footers: bool,
-    preserve_ocr_candidates: bool,
-    render_repairs: bool,
-    include_structure: bool,
+    mode: PageExtractionMode,
 ) -> Result<InternalPagesExtraction, PdfError> {
+    let PageExtractionMode {
+        strip_repeated_headers_footers,
+        preserve_ocr_candidates,
+        render_repairs,
+        include_structure,
+    } = mode;
     validate_pdf_bytes(buffer)?;
     let (doc, page_count, repairs) = load_document_from_mem_with_repairs(buffer, password)?;
     #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]

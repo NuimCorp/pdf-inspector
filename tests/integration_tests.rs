@@ -443,6 +443,7 @@ fn structured_pages_return_tables_and_exact_ocr_routing() {
 
     let scanned = make_pdf_with_glyph_layer(&[GlyphLayerPage {
         layer_mode: None,
+        large_image: true,
         ..SCAN_WITH_INVISIBLE_LAYER
     }]);
     let routed = extract_structured_pages_mem(&scanned).unwrap();
